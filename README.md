@@ -45,4 +45,4 @@ The system utilizes a **Lambda Architecture** where the "Shared Core" is a versi
 ## 📘 Deep Dive Documentation
 For a detailed technical breakdown of the architecture, including disaster recovery, idempotency strategies, and data integrity safety nets, please refer to the main technical blueprint:
 
-👉 **[Unified Architecture & HLD](HLD-README.md)**
+👉 **[Unified Architecture & HLD](README/HLD-README.md)**
