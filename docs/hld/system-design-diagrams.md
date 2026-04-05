@@ -155,7 +155,7 @@ graph LR
     API[AWS API Gateway]
     class API compute;
 
-    FA[FastAPI Service <br> AST Evaluator <br> 'Pay & Chase' Logic]
+    FA[FastAPI Service <br> AST Evaluator]
     class FA compute;
 
     subgraph Clients_Out [Synchronous Responses]

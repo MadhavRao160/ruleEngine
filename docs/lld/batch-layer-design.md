@@ -1,47 +1,82 @@
 # Low-Level Design (LLD): Spark Batch Processing Layer
 
-## 1. Architectural Philosophy
-The Spark Batch Layer operates on a **Config-Driven (DSL) Architecture**. To achieve both "Zero Logic Drift" and maximum big-data performance, the engine abandons row-by-row Python evaluation (`mapPartitions`). Instead, it translates shared JSON policy rules into **Native PySpark SQL Expressions**, leveraging the Catalyst Optimizer and Tungsten Execution Engine for raw speed.
+**Component:** Financial Reconciliation & State Correction Engine  
+**Compute:** Apache Spark (PySpark) on AWS EMR / Glue / Databricks  
+**Storage:** Amazon S3 (Medallion Architecture)  
+**Table Format:** Apache Iceberg  
+**Orchestration:** Apache Airflow (MWAA)
 
 ---
 
-## 2. The Policy DSL (Abstract Syntax Tree)
-Business rules are stored in DynamoDB as a JSON-based Domain Specific Language (DSL). This allows both the FastAPI speed layer and the Spark batch layer to read from a Single Source of Truth.
+## 1. Architectural Philosophy: The "Financial Truth" Engine
 
-* **Structure:** Rules are defined as recursive JSON objects (Abstract Syntax Trees) supporting logical operators (`AND`, `OR`), target fields, and condition thresholds.
-* **Separation of Concerns:** The DSL focuses strictly on evaluation. It assumes that all necessary context (e.g., employee department, rolling totals) has already been hydrated into the dataset prior to evaluation.
+The Batch Layer is the system's "Ground Truth." While the Speed Layer is optimized for **Latency** (sub-50ms provisional decisions), the Batch Layer is optimized for **Integrity** (high-throughput final audits).
 
----
-
-## 3. The Native PySpark Compiler (AST Translator)
-This component runs entirely on the **Spark Driver** before distributed data processing begins. It acts as a compiler, parsing the JSON DSL and generating a highly optimized execution plan.
-
-* **Recursive Parsing:** A `RuleCompiler` service reads the JSON tree and recursively maps conditions to PySpark native column functions.
-    * *Pseudocode:* Translates `{field: amount, operator: >, value: 100}` into `F.col("amount") > 100`.
-* **Column Chaining:** A `BatchEvaluationService` dynamically chains these compiled expressions using `F.when().otherwise()`, writing the outcomes to an `evaluation_result` column without breaking the Catalyst execution plan.
+### Core Responsibilities:
+* **Audit & Reconciliation:** Matching real-time "Provisional Holds" (from Kafka) against "Final Settlements" (from Bank CSVs).
+* **Zero Logic Drift:** Utilizing the exact same **JSON AST** policies as the Speed Layer, compiled into native Spark expressions.
+* **State Correction (The True-Up):** Identifying "State Drift"—discrepancies between holds and settlements—and pushing corrections back to the Speed Layer’s DynamoDB ledger.
+* **Compliance & Reporting:** Providing an immutable, time-travel-enabled dataset for Finance and SOC2 audits.
 
 ---
 
-## 4. Stateful Aggregations (Native Windowing)
-The system calculates running totals (e.g., "Daily Caps") natively without relying on external databases or in-memory Python dictionaries, preventing `OutOfMemory` errors across the 4TB payload.
+## 2. Medallion Data Lifecycle (S3 + Apache Iceberg)
 
-* **Pre-computation:** An Aggregation Service uses PySpark `Window.partitionBy()` (e.g., partitioned by `employee_id` and ordered by `transaction_timestamp`) to calculate and append running totals to the DataFrame *before* the DSL evaluates the row.
-* **State Management:** Spark natively manages the state using Tungsten off-heap memory, gracefully spilling to local executor NVMe SSDs if a specific partition exceeds available RAM.
+We utilize a strictly zoned architecture to transform raw ingest into high-integrity financial aggregates.
+
+### 2.1 Bronze Layer (Raw & Immutable)
+* **API Decision Archive:** S3-buffered Kafka events containing every decision made by the FastAPI workers.
+* **Bank Settlement Files:** Raw 3–4TB CSV/ISO-20022 files ingested from partner banks via the "Claim Check" pattern.
+* **Constraint:** Data is append-only and immutable. It serves as the system’s "Flight Data Recorder."
+
+### 2.2 Silver Layer (Standardized & Matched)
+* **Schema Enforcement:** Spark standardizes messy, multi-source bank data into a unified schema.
+* **The Heavy Join:** Spark joins the API Decision records with the Bank Settlement records using a **Left Outer Join** to capture "Orphaned Decisions" (holds that haven't yet settled).
+* **Match Keys:** A composite key consisting of `Network_TX_ID`, `Employee_ID`, and `Normalized_Amount`.
+
+### 2.3 Gold Layer (The Reconciled Truth)
+* **Logic Application:** Spark executes the **AST Evaluator** over the matched records.
+* **Delta Calculation:** Spark calculates the `True_Up_Delta`.
+    * *Scenario:* If a $200 hotel hold was settled for $150, the Delta is +$50.
+* **Audit Snapshot:** The final, reconciled record is saved as an Iceberg table, ready for Athena querying.
 
 ---
 
-## 5. Data Skew Management
-To handle uneven data distribution, the architecture employs a hybrid skew-mitigation strategy.
+## 3. The AST Compiler (Native Spark Expressions)
 
-* **Join Skew:** Addressed natively by enabling Spark's Adaptive Query Execution (`spark.sql.adaptive.enabled = true`). AQE dynamically splits skewed partitions during upstream data hydration.
-* **Aggregation Skew:** Addressed via a **Two-Pass Salting Pattern**. If a global window aggregation funnels massive amounts of data to a single node, a random `salt` column is temporarily added to distribute the initial sum across all executors, followed by a final global sum.
+To process terabytes of data, the engine avoids row-by-row Python `map` operations or UDFs, which incur high serialization overhead.
+
+* **Compiler Logic:** The Spark Driver reads the JSON AST and recursively translates logical nodes into **Native Spark SQL Expressions** (`pyspark.sql.functions`).
+* **Vectorized Execution:** By chaining `F.when().otherwise()` expressions, the logic runs inside Spark’s **Tungsten** engine. This ensures the evaluation stays within JVM memory, achieving maximum throughput.
+* **Parity:** Because the compiler uses the same JSON source as the Speed Layer, we guarantee 100% logic parity between a card swipe and a nightly audit.
 
 ---
 
-## 6. Medallion Storage & Idempotent Upserts
-The physical storage layer guarantees strict financial data integrity, ensuring that Airflow pipeline retries never result in duplicate expenses.
+## 4. The "True-Up" Loop (Reverse ETL to DynamoDB)
 
-* **Medallion Tiers:** * **Bronze:** Append-only raw Amex/Chase CSV dumps.
-    * **Silver:** Cleaned, schema-enforced, and tokenized data.
-    * **Gold:** The finalized, reconciled dataset containing `approved_amount` and `excess_amount`.
-* **ACID Transactions:** The Gold table utilizes an open-table format (Delta Lake / Apache Iceberg). Writes are executed using the `MERGE INTO` pattern matched on `expense_id`. This guarantees idempotency—if a job crashes and restarts, existing records are safely updated rather than duplicated.
+This is the system's "Self-Healing" mechanism. Once Spark identifies a discrepancy, it must correct the Speed Layer’s "Exposure Cache."
+
+### The Sync Workflow:
+1.  **Detection:** Spark filters for records where `Settled_Amount != Provisional_Amount`.
+2.  **Aggregation:** Spark groups deltas by `Employee_ID` to minimize the number of write IOPS to DynamoDB.
+3.  **Atomic Correction:** Using the **Spark-to-DynamoDB Connector**, the job issues an `UpdateItem` request with the `ADD` operation.
+4.  **Result:** The employee’s real-time spending power is restored (or deducted) to match the bank's finalized clearing.
+
+---
+
+## 5. Handling Data Skew & Scalability
+
+Processing global corporate spend involves massive data skews (e.g., Black Friday spikes).
+
+* **Adaptive Query Execution (AQE):** Enabled via `spark.sql.adaptive.enabled`. Spark dynamically re-partitions data and optimizes join strategies (e.g., switching from Sort-Merge to Broadcast Hash) based on runtime statistics.
+* **Salting Technique:** To prevent "Hot Partitions" when aggregating by `Department_ID`, a random "salt" column is added. This distributes the aggregation load across all executors before a final global merge, preventing Out-Of-Memory (OOM) errors.
+
+---
+
+## 6. Auditability & Time-Travel
+
+By utilizing **Apache Iceberg**, the system provides features essential for financial compliance:
+
+* **Snapshot Isolation:** Users can query the Gold layer as it existed at any point in time (e.g., `FOR SYSTEM_TIME AS OF '2026-04-01'`).
+* **ACID Transactions:** Ensures that Airflow pipeline retries do not result in duplicate records or partial writes.
+* **Amazon Athena Integration:** Finance teams can run standard SQL queries for monthly tax reporting and spend-trend analysis without touching the production compute environment.
