@@ -3,7 +3,7 @@
 This document contains detailed architectural diagrams for the Unified Platform.
 
 ## 1. The Master Data Map (Lambda Architecture)
-This shows the macro-level split between the Speed Layer and the Batch Layer, unified by the Shared Core.
+This shows the macro-level split between the Speed Layer and the Batch Layer.
 
 ```mermaid
 graph TD
@@ -22,11 +22,12 @@ graph TD
     %% 2. DEFINE COMPONENTS
     %% ==========================================
     
-    subgraph Clients [Clients & Sources]
-        Mobile[Mobile / Web App]
-        Partner["Partner Banks data (in TB, in CSVformat)"]
+    subgraph Clients [External Entities & Sources]
+        Mobile[Mobile / Web App <br> Manual Claims]
+        CardNet[Card Network Webhooks <br> Real-Time Swipes]
+        Bank["Partner Bank <br> Nightly Settlement CSV"]
     end
-    class Mobile,Partner external;
+    class Mobile,CardNet,Bank external;
 
     subgraph Edge [Edge & Ingestion]
         API_GW[AWS API Gateway]
@@ -34,33 +35,31 @@ graph TD
     end
     class API_GW,Pre_Signed router;
 
-    subgraph Speed_Layer [Speed Layer: Real-Time Synchronous]
-        FastAPI[FastAPI Service <br> AST Evaluator]
-        Kafka[Apache Kafka Event Stream]
+    subgraph Speed_Layer [Speed Layer: Real-Time Gatekeeper]
+        FastAPI[FastAPI Service <br> AST Rule Evaluator]
+        Kafka[Apache Kafka <br> Event Bridge]
     end
     class FastAPI compute;
     class Kafka stream;
 
-    subgraph DynamoDB [Amazon DynamoDB: The Physical Shared Core]
-        State[(Budget Utilization Ledger <br> Real-Time Balances)]
+    subgraph DynamoDB [Amazon DynamoDB: The Active State]
+        State[(Budget Utilization Ledger <br> Exposure Cache)]
         DSL[(Rules Table <br> JSON AST Policies)]
     end
     class State database;
     class DSL core; 
 
-    subgraph Batch_Layer [Batch Layer: Asynchronous Heavy]
+    subgraph Batch_Layer [Batch Layer: Reconciliation]
         Airflow[Apache Airflow Orchestration]
-        Spark[Apache Spark Cluster <br> Native PySpark SQL & Windowing]
-        DLQ[(S3 Dead Letter Queue)]
+        Spark[Apache Spark Cluster <br> ETL & Auditing]
     end
     class Airflow,Spark compute;
-    class DLQ database;
 
-    subgraph Storage [Lakehouse Storage]
+    subgraph Storage [Analytical Lakehouse]
         Bronze[(Bronze S3 Raw Data)]
         Silver[(Silver S3 Clean Data)]
         Gold[(Gold S3 / Iceberg Aggregates)]
-        Athena[Amazon Athena Finance Dashboard]
+        Athena[Amazon Athena <br> Finance Dashboard]
     end
     class Bronze,Silver,Gold s3;
     class Athena external;
@@ -68,30 +67,34 @@ graph TD
     %% ==========================================
     %% 3. DEFINE CONNECTIONS
     %% ==========================================
-    Mobile -->|JSON| API_GW
+    %% Real-Time Paths
+    Mobile -->|JSON Request| API_GW
+    CardNet -->|Synchronous Auth Webhook| API_GW
     API_GW --> FastAPI
     
-    Partner -->|Request Upload| Pre_Signed
-    Partner -->|Direct PUT| Bronze
+    %% Speed Layer Operations
+    FastAPI <-->|Check/Update Balance <br> Conditional Write| State
+    DSL -.->|Load JSON Policy| FastAPI
     
-    %% Speed Layer State & Logic Flow
-    FastAPI <-->|Fetch/Update Totals| State
-    DSL -.->|JSON Policy Data Flow| FastAPI
-    
-    FastAPI -->|Fire & Forget| Kafka
+    %% Event Decoupling
+    FastAPI -->|Fire & Forget Decision| Kafka
     Kafka -->|Stream Load| Bronze
 
-    Airflow -->|Triggers Daily| Spark
-    Bronze -->|Reads 4TB| Spark
+    %% Asynchronous Batch Path
+    Bank -->|Direct PUT| Bronze
+    Bank -.->|Request Upload| Pre_Signed
     
-    %% Batch Layer State & Logic Flow
-    DSL -.->|JSON Policy Data Flow| Spark
+    %% Batch Operations
+    Airflow -->|Triggers Nightly| Spark
+    Bronze -->|Reads Combined Data| Spark
+    DSL -.->|Batch Policy Sync| Spark
     
-    Spark -->|Bad Rows| DLQ
-    Spark -->|Clean Results| Silver
-    Silver --> Gold
+    Spark -->|Clean & Map| Silver
+    Silver -->|Aggregate Math| Gold
     Gold --> Athena
-    Gold -.->|Nightly State Sync| State
+    
+    %% The True-Up Loop
+    Gold -.->|Reverse ETL <br> Settlement True-Up| State
 ```
 
 ## 2: The Ingestion "Claim Check" Pattern.
@@ -102,27 +105,27 @@ sequenceDiagram
     autonumber
     
     %% Define Participants
-    actor Partner as Partner Bank System
+    actor Bank as Partner Bank (Settlement)
     participant API as AWS API Gateway
-    participant FA as FastAPI (Intelligent Router)
-    participant S3 as AWS S3 (Bronze Bucket)
+    participant FA as FastAPI (Ingestion Controller)
+    participant S3 as AWS S3 (Bronze Lakehouse)
 
-    Note over Partner, FA: Step 1: Requesting the "Ticket" (Micro-Payload)
-    Partner->>API: POST /v1/upload-request {size: few TB, partner: "Amex"}
+    Note over Bank, FA: Step 1: Requesting the "Ticket" (Micro-Payload)
+    Bank->>API: POST /v1/settlement/upload-request {size: "1TB", partner: "Visa_Settlement"}
     API->>FA: Route Request
-    FA-->>FA: Authenticate & Validate Payload Size
+    FA-->>FA: Authenticate Identity & Authorize Upload
     
-    Note over FA, S3: FastAPI asks AWS for a secure, temporary upload URL
+    Note over FA, S3: FastAPI acts as the Controller, asking AWS for a temporary, secure URL
     FA->>S3: Request Pre-Signed URL (Action: PUT, Expiry: 15m)
-    S3-->>FA: Return cryptographic URL string
+    S3-->>FA: Return Cryptographic URL string
     FA-->>API: HTTP 200 OK {upload_url: "https://s3.aws.com/..."}
-    API-->>Partner: HTTP 200 OK {upload_url: "https://s3.aws.com/..."}
+    API-->>Bank: HTTP 200 OK {upload_url: "https://s3.aws.com/..."}
 
-    Note over Partner, S3: Step 2: The Actual Upload (Macro-Payload)<br/>Notice that FastAPI and API Gateway are no longer involved.
+    Note over Bank, S3: Step 2: The Actual Upload (Macro-Payload)<br/>FastAPI and API Gateway are bypassed to prevent memory exhaustion.
     
-    Partner->>S3: HTTP PUT /1TB_Amex_Data.csv (using upload_url)
+    Bank->>S3: HTTP PUT /1TB_Settlement_Data.csv (using upload_url)
     S3-->>S3: Validate Cryptographic Signature & Expiry
-    S3-->>Partner: HTTP 200 OK (File safely stored)
+    S3-->>Bank: HTTP 200 OK (Settlement File Safely Landed)
 ```
 
 ## 3: The Speed Layer (Real-Time)
@@ -143,38 +146,47 @@ graph LR
     %% 2. SYMMETRICAL PIPELINE (Left to Right)
     %% ==========================================
     
-    User_In((Mobile App <br> Request))
-    class User_In external;
+    subgraph Clients_In [Synchronous Inputs]
+        Mobile_In((Mobile App <br> Manual Upload))
+        CardNet_In((Card Network <br> POS Webhook))
+    end
+    class Mobile_In,CardNet_In external;
 
     API[AWS API Gateway]
     class API compute;
 
-    FA[FastAPI Service <br> AST Evaluator]
+    FA[FastAPI Service <br> AST Evaluator <br> 'Pay & Chase' Logic]
     class FA compute;
 
-    User_Out((Mobile App <br> Response))
-    class User_Out external;
+    subgraph Clients_Out [Synchronous Responses]
+        Mobile_Out((Mobile App <br> UI Update))
+        CardNet_Out((POS Terminal <br> Approve/Decline))
+    end
+    class Mobile_Out,CardNet_Out external;
 
     %% Main Request-Response Spine
-    User_In -->|1. POST| API
+    Mobile_In -->|1a. POST JSON| API
+    CardNet_In -->|1b. Auth Request| API
     API -->|2. Route| FA
-    FA -->|5. HTTP 200| User_Out
+    
+    FA -->|"5a. HTTP 200 (Status)"| Mobile_Out
+    FA -->|5b. HTTP 200/403| CardNet_Out
 
     %% ==========================================
     %% 3. THE SHARED CORE (Vertical Axis)
     %% ==========================================
     
-    subgraph DynamoDB [Amazon DynamoDB: The Physical Shared Core]
+    subgraph DynamoDB [Amazon DynamoDB: The Active State]
         direction TB
         DSL[(Rules Table <br> JSON AST Policies)]
-        State[(Budget Utilization Ledger <br> Real-Time Balances)]
+        State[(Budget Utilization Ledger <br> Exposure Cache)]
     end
     class State database;
     class DSL core;
 
     %% Database Interactions (Hanging vertically off FastAPI)
-    DSL -.->|4. Fetch Rules| FA
-    FA <-->|3. Hydrate & Update| State
+    DSL -.->|3. Load Context| FA
+    FA <-->|"4. Conditional Write <br> (Optimistic Lock)"| State
 
     %% ==========================================
     %% 4. ASYNC OUTPUT (Off-axis)
@@ -183,7 +195,7 @@ graph LR
     Kafka[Apache Kafka <br> Event Stream]
     class Kafka stream;
 
-    FA -.->|6. Async Event| Kafka
+    FA -.->|"6. Fire Async Event <br> (Decision Payload)"| Kafka
 
     %% ==========================================
     %% 5. LAYOUT TWEAKS (Invisible Symmetry)
@@ -196,7 +208,7 @@ graph LR
 This diagram shows the asynchronous orchestration of massive historical data through the Medallion architecture (Bronze, Silver, Gold).
 
 ```mermaid
-graph TD
+graph LR
     %% ==========================================
     %% 1. STYLE DEFINITIONS
     %% ==========================================
@@ -207,67 +219,55 @@ graph TD
     classDef airflow fill:#e1f5fe,stroke:#01579b,stroke-width:1px,color:#000;
 
     %% ==========================================
-    %% 2. TOP LEVEL: INGESTION & CONTROL
+    %% 2. PIPELINE ZONES (Left to Right)
     %% ==========================================
-    subgraph Control_Zone ["1. Control Plane"]
+
+    subgraph Inputs [1. Inputs & Control]
         Airflow[Apache Airflow <br> Orchestrator]
+        DSL[(Rules Table <br> JSON Policies)]
+        Bronze_Events[(Bronze S3 <br> Kafka API Holds)]
+        Bronze_Bank[(Bronze S3 <br> Bank CSV Settlements)]
     end
     class Airflow airflow;
-
-    Bronze[(Bronze S3 <br> 4TB Raw CSV)]
-    class Bronze s3;
-
-    %% ==========================================
-    %% 3. MIDDLE LEVEL: COMPUTE & RULES
-    %% ==========================================
-    subgraph Core_Zone ["2. Shared Core Logic"]
-        DSL[(Rules Table <br> JSON AST Policies)]
-    end
     class DSL core;
+    class Bronze_Events,Bronze_Bank s3;
 
-    Spark[Spark Cluster <br> Native SQL & Windowing]
+    subgraph Processing [2. Compute Engine]
+        Spark[Spark Cluster <br> Match, Audit & True-Up]
+        DLQ[(S3 Dead Letter <br> Bad Rows)]
+    end
     class Spark compute;
-
-    DLQ[(S3 Dead Letter <br> Bad Rows)]
     class DLQ database;
 
-    %% ==========================================
-    %% 4. BOTTOM LEVEL: REFINEMENT & STATE
-    %% ==========================================
-    Silver[(Silver S3 <br> Cleaned Parquet)]
-    class Silver s3;
-
-    Gold[(Gold S3 <br> Budget Aggregates)]
-    class Gold s3;
-
-    subgraph State_Zone ["3. Ledger Persistence"]
-        State[(Budget Utilization Ledger <br> Real-Time Balances)]
+    subgraph Storage [3. Refined Lakehouse]
+        Silver[(Silver S3 <br> Cleaned Parquet)]
+        Gold[(Gold S3 <br> True-Up Deltas)]
     end
+    class Silver,Gold s3;
+
+    subgraph Outputs [4. Downstream Actions]
+        Athena[Amazon Athena <br> Finance BI]
+        State[(DynamoDB Ledger <br> Update State)]
+    end
+    class Athena compute;
     class State database;
 
-    Athena[Amazon Athena <br> BI & Finance]
-    class Athena compute;
-
     %% ==========================================
-    %% 5. THE VERTICAL CONNECTIONS (THE SPINE)
+    %% 3. THE DATA FLOW CONNECTIONS
     %% ==========================================
     
-    %% Main Data Downward Flow
-    Bronze -->|3. Load| Spark
-    Spark -->|5. Transform| Silver
-    Silver -->|6. Aggregate| Gold
-    Gold -->|7. Query| Athena
+    %% Ingestion to Compute
+    Airflow -.->|1. Trigger Nightly| Spark
+    DSL -.->|2. Load Logic| Spark
+    Bronze_Events -->|3a. Read Provisional| Spark
+    Bronze_Bank -->|3b. Read Finalized| Spark
 
-    %% Orchestration (Inward from Left)
-    Airflow -->|1. Sensor/Scheduled| Bronze
-    Airflow -->|2. Provision| Spark
+    %% Compute to Storage
+    Spark -.->|Parse Errors| DLQ
+    Spark -->|4. Clean & Match| Silver
+    Silver -->|5. Aggregate| Gold
 
-    %% Logic Ingestion (Inward from Right)
-    DSL -.->|4. Fetch Rules| Spark
-
-    %% Error Routing (Outward to Left)
-    Spark -.->|DLQ| DLQ
-
-    %% Reconciliation (Inward from Bottom-Right)
-    Gold -.->|8. Nightly State Sync| State
+    %% Storage to Outputs
+    Gold -->|6. Query Data| Athena
+    Gold -.->|7. Reverse ETL Sync| State
 ```

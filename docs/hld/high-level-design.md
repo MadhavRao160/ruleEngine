@@ -1,177 +1,199 @@
-# Expense Policy Rules Engine - Unified Architecture & HLD
+# High-Level Design: Real-Time Spend Authorization Gateway
 
-## 👨‍💻 Author
-#### Madhav Rao
-#### Principal Architect | Distributed Data Systems
+**Author:** Madhav Rao  
+**Role:** Principal Architect | Distributed Data Systems
 
 ---
 
 ## 🎯 Project Objective
-The **Expense Policy Rules Engine** is an enterprise-grade, distributed data platform designed to validate corporate travel and business expenses against a dynamic set of company policies. 
+The **Real-Time Spend Authorization Gateway** is a mission-critical financial decision engine designed to evaluate and control corporate spend at the exact moment of transaction. By shifting from a reactive auditing model to a proactive authorization model, the platform solves three distinct engineering and financial challenges across two compute extremes:
 
-It solves three critical business challenges across two entirely different compute extremes:
-1. **Real-Time Synchronous Validation:** Providing sub-20ms validations for individual employees submitting single-trip expenses via the mobile app.
-2. **Bulk Partner Ingestion:** Processing massive 3-4TB daily data dumps from corporate credit card partners (e.g., Amex, Chase) to reconcile system-driven transactions.
-3. **Historical Backfill Auditing:** Re-evaluating billions of historical records in the Data Lakehouse whenever corporate policies change to retroactively flag compliance violations.
+1. **Real-Time Point-of-Sale Authorization (The Speed Layer):** Providing sub-50ms cryptographic decisions for global credit card network webhooks (e.g., Visa, Stripe) and manual mobile API requests, physically preventing budget overruns before money leaves the account.
+2. **Asynchronous Financial True-Up (The Batch Layer):** Processing terabyte-scale nightly settlement files from partner banks to reconcile provisional real-time holds against finalized financial reality. This layer automatically corrects "state drift" caused by hotel holds, refunds, and calculates employee liabilities for "Pay & Chase" overages.
+3. **Zero Logic Drift (The Shared Core):** Ensuring that the exact same financial policies—defined as JSON-based Abstract Syntax Trees (AST)—are executed by a millisecond-latency API and a massive PySpark cluster without duplicating code.
 
-To achieve this without duplicating business logic, the system utilizes a **Lambda Architecture** built around a **Shared Core** using strict **Domain-Driven Design (DDD)** and **Clean Architecture** principles.
+To achieve this without race conditions or double-spending, the system utilizes a modern **Lambda Architecture**, relying on strict conditional locking mechanisms within a highly available Distributed Ledger (DynamoDB).
 
 ---
 
 ## 🛠️ Technology Stack
-* **Language:** Python 3.x
-* **Web Framework:** FastAPI, Pydantic
-* **Big Data Compute:** Apache Spark (PySpark), Databricks / AWS EMR
-* **Event Streaming:** Apache Kafka
-* **Cloud Infrastructure:** AWS (API Gateway, S3, DynamoDB)
-* **Storage Format:** Apache Parquet, Delta Lake / Apache Iceberg
-* **Orchestration:** Apache Airflow
+The platform is built on a strictly segregated technology stack, optimizing for millisecond latency at the edge and massive parallel processing in the core.
+
+### The Logic Core (Shared)
+* **Domain Specific Language:** JSON-based Abstract Syntax Tree (AST).
+* **Evaluator Engine:** Pure Python (Stateless, zero-dependency engine capable of running in both Uvicorn workers and PySpark UDFs).
+
+### The Speed Layer (Real-Time Authorization)
+* **Web Framework:** FastAPI (Async execution) with Pydantic (Strict payload validation).
+* **Stateful Ledger:** Amazon DynamoDB (Utilized specifically for single-digit millisecond reads and Conditional Writes/Optimistic Locking).
+* **API Gateway:** AWS API Gateway (Handling webhook routing and payload throttling).
+
+### The Event Bridge (Decoupling)
+* **Message Broker:** Apache Kafka / Amazon MSK (High-throughput, persistent event streaming for fire-and-forget API offloading).
+
+### The Batch Layer (Reconciliation & True-Up)
+* **Big Data Compute:** Apache Spark / PySpark (Running on AWS EMR or AWS Glue for terabyte-scale CSV ingestion and state drift calculation).
+* **Data Lake Storage:** Amazon S3 (Bronze/Silver/Gold Medallion Architecture).
+* **Table Format:** Apache Iceberg or Delta Lake (For ACID compliance and time-travel querying on the Data Lake).
+* **Orchestration:** Apache Airflow / MWAA (Managing the nightly settlement and reverse-ETL DAGs).
+* **Analytics:** Amazon Athena (Serverless SQL querying for Finance BI dashboards).
 
 ---
 
 ## 1. System Overview & Architectural Patterns
-This monorepo houses multiple execution environments that all import from a single, framework-agnostic core domain to process the "Corporate Spend Validation" Bounded Context.
 
-* **Domain-Driven Design (DDD):** The system strictly models the business domain, utilizing the `Trip` as the Aggregate Root.
-* **Config-Driven Architecture (The Shared Core):** To achieve "Zero Logic Drift," business rules are not hardcoded. They are defined as a Domain-Specific Language (DSL) stored as JSON Abstract Syntax Trees. Both the FastAPI web servers and the Spark Big Data clusters read from this exact same JSON source, acting as diverse execution engines for a unified policy set.
-* **Extensibility:** Designed so adding new policy rules requires zero modifications to the core evaluation execution loop.
+### 1.1 System Overview
+The Real-Time Spend Authorization Gateway is a distributed, high-availability financial engine designed to evaluate corporate spend policies at the point of sale. It operates at the intersection of microsecond Online Transaction Processing (OLTP) and terabyte-scale Online Analytical Processing (OLAP). The system serves as the definitive gatekeeper between external financial networks (e.g., Visa, Stripe, mobile clients) and internal corporate ledgers. It is designed around a dual-lifecycle model:
+* **Synchronous Authorization:** Providing strictly bound, sub-50ms REST/JSON webhook responses to external card networks to approve or decline real-time transactions.
+* **Asynchronous Settlement:** Processing massive delayed clearing files from partner banks to reconcile provisional holds, process refunds, and correct long-term state drift.
+
+### 1.2 Core Architectural Patterns
+
+**A. Modified Lambda Architecture**
+Traditional Lambda architectures run identical logic across both real-time and batch layers to produce a unified view. This system modifies that pattern into a **Complementary Lambda Architecture**:
+* **The Speed Layer:** Acts as an "Exposure Cache." It makes provisional, real-time decisions based on immediate state and strictly manages risk (the "Hold").
+* **The Batch Layer:** Acts as the "Financial Truth." It ingests delayed settlement data to perform a final audit and executes a Reverse-ETL sync to correct any discrepancies (the "True-Up").
+
+**B. Stateless Compute with a Stateful Distributed Ledger**
+The compute nodes evaluating the financial rules (FastAPI workers) are strictly stateless. They can be scaled horizontally infinitely and killed without warning. All financial state—specifically the employee's remaining budget—is centralized in a highly available NoSQL ledger (Amazon DynamoDB). 
+* **Concurrency Control:** To prevent "double-spending" race conditions during simultaneous card swipes, the system relies entirely on DynamoDB’s **Optimistic Locking (Conditional Writes)** rather than application-level memory locks.
+
+**C. Event-Driven Decoupling (The "Fire-and-Forget" Bridge)**
+Because the external REST/JSON webhook expects an HTTP response within milliseconds, the Speed Layer cannot afford to communicate directly with downstream analytical or HR systems. Once FastAPI successfully commits the budget deduction to DynamoDB, it emits a standardized JSON decision payload to an Apache Kafka topic and immediately closes the HTTP request. Kafka acts as an asynchronous shock absorber, decoupling the fast, synchronous API world from the heavy, asynchronous Big Data world.
+
+**D. Configuration-Driven Logic (AST Rule Engine)**
+To prevent "logic drift" between the API microservices and the Big Data clusters, financial policies are not hardcoded into Python. Instead, business rules are defined as **JSON-based Abstract Syntax Trees (AST)**. Both the FastAPI Speed Layer and the PySpark Batch Layer pull from the exact same JSON policy definitions. This allows the business to deploy new financial rules instantly across the entire platform without requiring a code deployment.
+
+**E. Medallion Lakehouse Architecture**
+The Batch Layer utilizes a strictly zoned Data Lakehouse pattern (Bronze, Silver, Gold) resting on Amazon S3.
+* **Bronze (Raw):** Ingests both the real-time API Kafka events and the raw CSV bank settlement files.
+* **Silver (Cleaned & Matched):** Standardizes schemas and matches the provisional API holds against the finalized bank settlements.
+* **Gold (Aggregated):** Calculates the final financial true-ups (refunds, overages, dropped holds) which are then fed into BI tools (Athena) and the automated Reverse-ETL pipeline back to DynamoDB.
 
 ---
 
 ## 2. Entrypoints & The Intelligent Router (Ingestion)
-To protect the real-time web servers from massive data warehousing workloads, traffic is split at the edge based on payload size and source intent.
 
-* **Micro-Payloads (Mobile/Web Apps):** Standard HTTP requests route through the **AWS API Gateway** directly to the FastAPI Speed Layer.
-* **Macro-Payloads (The Claim Check Pattern):** Corporate partners (e.g., Amex, Chase) sending 1TB+ CSV files cannot use the API Gateway. Instead:
-  1. The partner requests an upload ticket via a lightweight FastAPI endpoint.
-  2. FastAPI generates a temporary, secure **S3 Pre-Signed URL**.
-  3. The partner uploads the massive file directly into the S3 Bronze bucket, bypassing the web servers entirely.
+### 2.1. Unified RESTful Gateway (AWS API Gateway)
+All external traffic enters the system through **AWS API Gateway**. This layer provides the necessary security and traffic management:
+* **TLS Termination & WAF:** Ensures all incoming webhooks and mobile requests are encrypted and filtered for common web exploits.
+* **Source-Based Throttling:** Applies distinct rate-limiting tiers. Card network webhooks are prioritized with high-burst allowances, while manual mobile uploads are throttled to prevent "noisy neighbor" impacts on the Speed Layer.
+* **Stateless Routing:** Directs traffic to the FastAPI cluster via a Private Link, ensuring the internal microservices are never exposed directly to the public internet.
+
+### 2.2. The Fast-Path: Real-Time Transaction Ingestion
+The most critical entry point is the **Synchronous Webhook Endpoint** (`POST /v1/webhooks/card-auth`).
+* **Payload Validation:** FastAPI uses **Pydantic** to perform strict, zero-copy schema validation. If the payload does not match the banking standard (e.g., ISO 20022 JSON mapping), it is rejected at the edge with an HTTP 400.
+* **Context Hydration:** The router immediately extracts the `Employee_ID` and `Merchant_Category` to prepare the context for the AST Evaluator.
+* **Synchronous Response:** The connection is held open until a decision is reached (Approve/Decline). The router is designed to return a response within a 50ms window to prevent timeouts at the physical Point-of-Sale (POS) terminal.
+
+### 2.3. The Slow-Path: Settlement Ingestion (Claim Check Pattern)
+To handle massive nightly data dumps (3–4TB) from partner banks without overwhelming the API's memory or bandwidth, the system implements the **Claim Check Pattern**:
+* **Metadata Request:** The Partner Bank sends a lightweight "Upload Request" containing file metadata (size, checksum, partner ID).
+* **Pre-Signed URL Generation:** Instead of accepting the file, the FastAPI router generates an **AWS S3 Pre-signed URL**. This URL is a time-limited, cryptographically signed token that grants the bank's system permission to upload directly to a specific "Bronze" S3 prefix.
+* **Direct-to-S3 Upload:** The bank's system uploads the multi-terabyte CSV directly to S3. This bypasses the API Gateway and FastAPI entirely, ensuring that the heavy ingestion of historical data never competes with real-time card authorizations.
+
+### 2.4. Intelligent Load Shedding
+The router acts as a circuit breaker. If the **DynamoDB** latency exceeds a pre-defined threshold (e.g., >100ms), the Intelligent Router can trigger a "Failsafe" mode:
+* **For Card Swipes:** It can be configured to default to "Stand-In Processing" (STIP), allowing small-value transactions to pass through while logging the event for later reconciliation.
+* **For Manual Claims:** It returns an HTTP 202 (Accepted), telling the user the claim will be processed shortly, moving the task from a synchronous wait to an asynchronous background job.
 
 ---
 
 ## 3. The Speed Layer (Real-Time Synchronous Path)
-Handles synchronous, low-latency (`< 20ms`) requests for individual employees submitting expenses.
 
 ### 3.1 Component Flow
-1. **Controller Layer (FastAPI):** Intercepts HTTP POST. Utilizes Pydantic schemas to strictly validate incoming JSON payloads.
-2. **State Hydration:** Queries DynamoDB to fetch current trip totals and applicable department rules.
-3. **Domain Evaluation:** Invokes a lightweight DSLEvaluator that parses the JSON rules dynamically against the hydrated Trip state to generate an EvaluationResult.
-4. **Event Broadcasting (Apache Kafka):** Asynchronously publishes the evaluation event to a Kafka topic (`realtime-expense-audits`) for Lakehouse ingestion and continuous compliance monitoring.
-5. **Response:** Translates the pure Python result back to JSON and returns HTTP 200.
+1.  **Request Ingestion & Validation:** FastAPI receives the REST/JSON payload. **Pydantic** models enforce strict schema validation.
+2.  **State Hydration (The Exposure Check):** The system performs a single-digit millisecond read from **Amazon DynamoDB** to fetch the employee’s current state, including remaining budget balances and active policy metadata.
+3.  **AST Policy Evaluation:** The stateless **Python AST Evaluator** executes the JSON-defined rules against the hydrated state. It calculates the decision based on **Strategy 2 (Pay and Chase)**:
+    * **Approved:** Within the base limit.
+    * **Approved with Overage:** Exceeds base limit but stays within the "Company Float" threshold.
+    * **Hard Decline:** Exceeds the maximum allowable float.
+4.  **Atomic State Persistence:** If the transaction is approved (fully or partially), FastAPI attempts to update the DynamoDB ledger. This uses **Optimistic Locking (Conditional Writes)** to ensure the balance is only deducted if it has not changed since the hydration step.
+5.  **Event Emission (Kafka Bridge):** The final decision—including the breakdown of company vs. employee liability—is published asynchronously to the **Apache Kafka** `transaction-decisions` topic.
+6.  **Synchronous Response:** The system returns the final status to the caller. For card webhooks, this is a binary Approve/Decline; for mobile users, this includes a detailed breakdown of the decision.
 
-### 3.2 API Contract
-**Endpoint:** `POST /v1/trips/evaluate`
+### 3.2 API Contracts
+**A. Card Network Webhook (`POST /v1/webhooks/card-auth`)**
+* **Request Payload:** Contains `network_tx_id`, `employee_id`, `amount`, `currency`, `mcc`, `merchant_name`.
+* **Response Payload (Status 200):** Contains `auth_decision: "APPROVE"`, `transaction_id`, `timestamp`.
 
-**Request Payload:**
-```json
-{
-  "trip_id": "trip_123",
-  "employee_id": "emp_999",
-  "department": "Engineering",
-  "currency": "USD",
-  "expenses": [
-    {
-      "expense_id": "001",
-      "amount": 80.00,
-      "expense_type": "restaurant",
-      "merchant_name": "Starbucks",
-      "merchant_category_code": "5814",
-      "transaction_date": "2026-04-01T12:30:00Z"
-    }
-  ]
-}
-```
+**B. Manual Claim Submission (`POST /v1/claims/manual`)**
+* **Request Payload:** Contains `claim_id`, `employee_id`, `amount`, `category`, `receipt_url`.
+* **Response Payload (Status 200):** Contains `status: "APPROVED_WITH_OVERAGE"`, `breakdown` (company_covered vs employee_liability), and a user-friendly `message`.
 
-**Response Payload:**
-```json
-{
-  "trip_id": "trip_123",
-  "overall_status": "PROVISIONALLY_ACCEPTED",
-  "total_submitted": 2100.00,
-  "total_approved": 2000.00,
-  "overall_violations": [
-    "Total Trip Budget of $2,000.00 exceeded. Final reimbursement capped."
-  ],
-  "expenses": [
-    {
-      "expense_id": "001",
-      "submitted_amount": 1100.00,
-      "approved_amount": 1100.00, 
-      "status": "APPROVED",
-      "violations": []
-    },
-    {
-      "expense_id": "002",
-      "submitted_amount": 1000.00,
-      "approved_amount": 900.00,
-      "status": "APPROVED_WITH_LIMIT",
-      "violations": ["Reduced by $100.00 to stay within the $2,000.00 total trip cap."]
-    }
-  ]
-}
-```
+### 3.3 Concurrency Guardrails
+The Speed Layer utilizes **DynamoDB Conditional Expressions** (`SET balance = balance - :val WHERE balance >= :min_required`) as the primary defense against race conditions. This ensures that even if two FastAPI workers attempt to authorize two different $60 swipes simultaneously against a $100 budget, only one will succeed.
+
+---
 
 ## 4. The Batch Layer (Asynchronous Heavy Path)
-Handles massive 4TB daily partner uploads and historical backfill audits.
 
-### 4.1 Pipeline Orchestration
-* **Apache Airflow:** A daily scheduled DAG utilizes S3 Sensors to detect when partner bulk files have successfully landed in the Bronze S3 bucket.
-* **Transient Compute:** Airflow dynamically provisions an ephemeral **Apache Spark** cluster (Databricks/EMR) to process the workload, shutting it down upon completion to control cloud costs.
+### 4.1. Role and Responsibilities
+The Batch Layer operates on a nightly schedule to perform deep financial reconciliation. Its primary responsibilities include matching real-time "Provisional Holds" (Kafka) against "Final Settlements" (Bank CSVs) and identifying "State Drift" (e.g., hotel hold releases or refunds).
 
-### 4.2 Distributed Execution
-* **The AST Translator (Native PySpark):** The Spark Driver reads the JSON DSL rules and acts as a compiler. It parses the abstract syntax trees and translates them into highly optimized, native PySpark SQL column expressions (e.g., chained F.when().otherwise() statements). This allows Spark's Catalyst Optimizer and Tungsten Execution Engine to process the policy logic natively at C++ speeds.
-* **Stateful Aggregations (Native Windowing):** Running totals and budget caps are calculated dynamically across the 4TB payload using PySpark Window Functions (Window.partitionBy("employee_id")). Spark manages this massive financial state natively using off-heap memory and graceful local SSD spilling, completely avoiding external database I/O bottlenecks during the batch run.
-* **Data Skew Management:** The pipeline natively mitigates massive enterprise data skew. It utilizes Adaptive Query Execution (AQE) to dynamically balance join operations, and implements a custom Two-Pass Salting strategy for global window aggregations to ensure even data distribution and prevent single-node executor crashes.
-* **Fault Tolerance:** Malformed incoming records (e.g., corrupted Amex CSV rows) are safely caught and routed to a Dead Letter Queue (DLQ) in S3. This ensures that isolated data quality issues do not fail the multi-hour enterprise batch job.
+### 4.2. The Medallion Lakehouse Lifecycle (S3 + Spark)
+* **Bronze (Raw Data):** Ingests two primary streams: **Kafka Event Archives** and **Bank Settlement Files**. Data is stored in original formats to allow for complete "Time-Travel" re-processing.
+* **Silver (Standardized & Matched):** Spark performs schema enforcement and joins API events to Bank records using a composite key (`Employee_ID` + `Merchant_ID` + `Date` + `Normalized_Amount`).
+* **Gold (Aggregated):** Calculates the final **True-Up Delta** (difference between provisional hold and actual bank charge) and flags "Pay & Chase" overages for payroll.
+
+### 4.3. The Reconciliation Logic (Match & Audit)
+Spark executes a "Fuzzy Matching" algorithm:
+1.  **Exact Match:** `Network_TX_ID` matches perfectly.
+2.  **Inferred Match:** Matches based on merchant, timestamp window, and employee ID.
+3.  **Exception Handling:** Unmatched transactions move to a **Manual Review Table** (Dead Letter Queue) for investigation.
+
+### 4.4. The State True-Up (Reverse ETL)
+Once the "Gold" truth is established, a dedicated Spark job performs an atomic increment/decrement on the employee's budget in **DynamoDB**, effectively "refunding" released holds back to the employee’s real-time limit.
+
+### 4.5. Analytical Access (Amazon Athena)
+The Gold layer is exposed via **Amazon Athena** for standard SQL queries for monthly closing, tax reporting, and spend-trend analysis.
 
 ---
 
 ## 5. The Serving & Storage Layer (State Management)
-To manage state across both real-time and big data workloads, the system utilizes a hybrid database approach with Eventual Consistency.
 
-### 5.1 Operational Database (Amazon DynamoDB)
-Provides single-digit millisecond reads for the FastAPI Speed Layer.
-* **Table 1: Rule Repository (ExpenseEngine-Rules):** PK: `DEPT#{department_name}`, SK: `RULE#{rule_id}`.
-* **Table 2: State Repository (ExpenseEngine-State):** PK: `EMP#{employee_id}`, SK: `BUDGET#{metric_type}#{date}`.
+### 5.1. Operational State: The Active Ledger (Amazon DynamoDB)
+* **Data Model:** Optimized for Key-Value access, using `Employee_ID` as the Partition Key (PK).
+* **Double-Spending Guard:** Employs **Optimistic Locking** on all updates.
+* **TTL (Time-to-Live):** Provisional records are assigned a TTL of 7 days to keep the table lean.
 
-### 5.2 The Data Lakehouse (S3 + Apache Iceberg / Delta Lake)
-Utilizes the Medallion Architecture, providing ACID transactions on top of object storage to support simultaneous writes from Kafka and Spark.
-* **Bronze (Raw):** Immutable landing zone for S3 partner bulk files and raw Kafka event logs.
-* **Silver (Cleaned):** Deduplicated, schema-enforced data ready for Spark processing.
-* **Gold (Business Ready):** The final `EvaluationResult` output tables. Highly aggregated and optimized for the Finance Team's BI dashboards and SQL query engines (e.g., Amazon Athena).
-* **State Reconciliation:** A nightly downstream task syncs the heavily verified Gold Layer aggregates back into the DynamoDB state tables to resolve any eventual consistency drift.
+### 5.2. Analytical State: The Medallion Lakehouse (Amazon S3)
+Implements Medallion Architecture using **Apache Iceberg** to provide ACID transactions, preventing "partial writes" during heavy Spark jobs.
+
+### 5.3. Configuration State: The Rule Repository
+Financial policies are treated as **State-as-Code**. JSON policy files are stored in versioned S3 buckets and cached locally by FastAPI and Spark nodes, ensuring global updates take effect within minutes.
+
+### 5.4. Managing State Drift (The Reconciliation Loop)
+1.  **Detection:** Spark identifies discrepancies (e.g., a $200 hold vs $150 final charge).
+2.  **Correction (Reverse ETL):** An atomic "Credit" update is fired back to the DynamoDB Ledger.
+3.  **Result:** The employee’s real-time spending power is restored.
 
 ---
 
 ## 6. Enterprise Resilience & Safety Nets
-To ensure the system is production-grade, fault-tolerant, and financially secure, the architecture implements several layers of infrastructure safety nets, strictly separating cloud-level resilience from code-level logic.
 
 ### 6.1 Reliability & Disaster Recovery (DR)
-The system is designed to survive a complete AWS region failure (e.g., `us-east-1` going offline) utilizing an **Active-Passive (Pilot Light)** strategy to balance high availability with cost efficiency.
-* **Target SLAs:** RTO `< 2 minutes` for the real-time API, RTO `< 4 hours` for the Batch Layer. RPO is strictly **Near-Zero**.
-* **Automated DNS Failover:** AWS Route53 health checks monitor the primary API Gateway. Upon failure, traffic is automatically routed to a scaled-down "Pilot Light" cluster in the secondary region (`us-west-2`), which rapidly auto-scales to meet demand.
-* **State & Storage Replication:** * **DynamoDB Global Tables** continuously replicate the transaction state and policy rules across regions with sub-second latency.
-  * **S3 Cross-Region Replication (CRR)** ensures the 4TB partner data dumps are securely backed up to the secondary region upon upload.
+* **Multi-AZ Deployment:** FastAPI nodes deployed across three AZs.
+* **Data Persistence:** DynamoDB Point-in-Time Recovery (PITR); S3 Cross-Region Replication (CRR).
+* **Metrics:** RTO < 15 minutes; RPO < 5 minutes.
 
 ### 6.2 Data Integrity & Concurrency
-Financial systems cannot tolerate duplicate transactions or lost updates due to network retries or concurrent usage.
-* **Idempotency (The "Double-Submit" Problem):** All API requests must include a client-generated UUID (`X-Idempotency-Key`). FastAPI utilizes DynamoDB Conditional Writes (`attribute_not_exists`) to guarantee a delayed network retry does not result in a double-charge.
-* **Race Conditions (The "Simultaneous Swipe"):** To prevent a user from overdrawing a budget via simultaneous requests from multiple devices, the DynamoDB state table utilizes **Optimistic Locking**. A `version` attribute is checked and incremented upon every write; conflicting parallel writes are rejected and re-evaluated.
-* **Batch Upserts:** The Spark layer strictly prohibits raw `INSERT` operations into the Silver and Gold layers. All data is written using Delta/Iceberg `MERGE INTO` syntax keyed on `transaction_id`, allowing the Airflow DAG to be safely re-run without duplicating the 4TB dataset.
+* **Idempotency Key:** `Network_TX_ID` prevents duplicate deductions during network retries.
+* **Optimistic Locking:** Ensures state consistency in distributed environments.
+* **ACID Lakehouse:** Apache Iceberg prevents "partial writes" during large batch updates.
 
 ### 6.3 Observability & Operational Workflows
-Monitoring focuses on business symptoms and data lifecycle management rather than purely tracking server CPU.
-* **Distributed Tracing:** An `X-Correlation-ID` is injected at the API Gateway and passed continuously through FastAPI, Kafka, and into the S3 Parquet files, allowing engineers to trace a single dropped expense across the entire distributed system via a centralized logging tool (e.g., ELK/Splunk).
-* **The DLQ Lifecycle:** Bad records isolated in the Dead Letter Queue trigger symptom-based alerts. Internal pipeline parser bugs trigger engineering code fixes and "Replay Jobs." External partner schema violations automatically generate and email error reports to the source partner for correction.
-* **Symptom Alerting:** PagerDuty is triggered based on SLA breaches, such as the FastAPI p99 latency exceeding 50ms, or DLQ volume exceeding standard thresholds.
+* **Distributed Tracing:** `X-Correlation-ID` traces a single swipe through the entire 24-hour Lambda lifecycle.
+* **Real-Time Monitoring:** Alarms for p99 latency > 100ms or Kafka lag > 5 minutes.
+* **Drift Alerting:** Alerts fired if the gap between provisional approval and bank settlement exceeds 5%.
 
 ### 6.4 Security & Data Governance
-Financial data and Personally Identifiable Information (PII) are secured at both the perimeter and the storage level.
-* **Authentication:** All entry points are secured via OAuth2/OIDC protocols. AWS API Gateway validates the JSON Web Tokens (JWT) before traffic touches the internal VPC.
-* **Encryption:** TLS 1.2+ enforces encryption in transit. AWS KMS (Customer-Managed Keys) enforces encryption at rest across S3, DynamoDB, and Kafka EBS volumes.
-* **Catalog-Level RBAC & Masking:** PII protection is decoupled from compute code. Using **AWS Lake Formation** and the **Glue Data Catalog**, row-level and column-level access controls are applied to the data lake. For example, if a business analyst queries the Gold tables via Amazon Athena, sensitive columns (like `bank_account_number`) are dynamically masked, whereas the internal Spark execution role can read the raw values.
+* **Encryption:** AES-256 at rest (KMS); TLS 1.3 in transit.
+* **Least Privilege:** FastAPI compute nodes have "Write-Only" access to Kafka and "Scoped-Read/Write" access to DynamoDB.
+* **PII Masking:** Redacts sensitive employee info in the Gold layer.
+* **Audit Logging:** Tamper-proof logs for every AST Policy change.
 
 ### 6.5 Infrastructure Scalability
-To handle the extreme data volume disparities (API vs. 4TB Batch) efficiently:
-* **Compute Auto-Scaling:** Both the FastAPI container orchestration layer (ECS/EKS) and the transient Spark clusters utilize dynamic auto-scaling rules to handle peak loads without paying for idle resources during off-hours.
-* **Storage Partitioning:** S3 Bronze, Silver, and Gold data files are physically partitioned by `event_date` (and heavily skewed banks where necessary). This prevents downstream systems (like Athena or Airflow sensors) from executing full 4TB table scans. *(Note: Code-level big data scaling, such as Adaptive Query Execution and Salting, are documented in the Low-Level Design).*
+* **FastAPI Scaling:** Horizontal Pod Autoscaling (HPA) based on CPU and RPS.
+* **Spark Dynamic Allocation:** Scales executors based on the size of the nightly bank file (4TB vs 100GB).
+* **DynamoDB Auto-Scaling:** Uses On-Demand mode for the baseline period, moving to Provisioned with Auto-Scaling for cost optimization.
