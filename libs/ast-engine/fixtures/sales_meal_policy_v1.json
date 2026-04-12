@@ -1,0 +1,82 @@
+{
+  "policy_id": "pol_sales_meal_v1",
+  "department_id": "SALES",
+  "version": "1.0.0",
+  "description": "Sales dining policy: $50/day base, $20 float. Blocked on weekends unless traveling.",
+  "execution_strategy": "PAY_AND_CHASE",
+  "required_metadata": [
+    "daily_meal_budget",
+    "daily_meal_consumed",
+    "company_float_allowance",
+    "is_traveling"
+  ],
+  "ast": {
+    "type": "LOGICAL_NODE",
+    "operator": "AND",
+    "nodes": [
+      {
+        "type": "CONDITION_LEAF",
+        "description": "1. Must be a Dining MCC (Restaurant, Fast Food, Grocery)",
+        "field": "request.mcc",
+        "operator": "IN",
+        "value": ["5812", "5814", "5411"]
+      },
+      {
+        "type": "LOGICAL_NODE",
+        "operator": "OR",
+        "description": "2. Temporal Block: Must be a weekday OR the user must be traveling",
+        "nodes": [
+          {
+            "type": "CONDITION_LEAF",
+            "field": "request.day_of_week",
+            "operator": "NOT_IN",
+            "value": ["SAT", "SUN"]
+          },
+          {
+            "type": "CONDITION_LEAF",
+            "field": "state.is_traveling",
+            "operator": "==",
+            "value": true
+          }
+        ]
+      },
+      {
+        "type": "DECISION_BRANCH",
+        "description": "3. The Math: Check amount against budget and float",
+        "branches": [
+          {
+            "description": "Scenario A: Under Base Budget",
+            "condition": {
+              "type": "CONDITION_LEAF",
+              "field": "request.amount",
+              "operator": "<=",
+              "dynamic_value": "state.daily_meal_budget - state.daily_meal_consumed"
+            },
+            "action": {
+              "status": "APPROVE",
+              "liability": "COMPANY_FULL"
+            }
+          },
+          {
+            "description": "Scenario B: Over Budget but inside Float (Pay & Chase)",
+            "condition": {
+              "type": "CONDITION_LEAF",
+              "field": "request.amount",
+              "operator": "<=",
+              "dynamic_value": "(state.daily_meal_budget - state.daily_meal_consumed) + state.company_float_allowance"
+            },
+            "action": {
+              "status": "APPROVED_WITH_OVERAGE",
+              "liability": "SPLIT_EMPLOYEE_OWES_OVERAGE"
+            }
+          }
+        ],
+        "fallback_action": {
+          "status": "HARD_DECLINE",
+          "reason_code": "EXCEEDS_MAXIMUM_FLOAT",
+          "message": "Amount exceeds both your daily budget and the allowed float."
+        }
+      }
+    ]
+  }
+}
