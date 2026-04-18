@@ -2,21 +2,9 @@ from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime
 
-
 class TransactionRequest(BaseModel):
     """
     Validates incoming card swipe data.
-
-    Example JSON:
-    {
-        "transaction_id": "tx-12345",
-        "user_id": "madhav_01",
-        "amount": 45.50,
-        "currency": "USD",
-        "merchant_name": "UberEats",
-        "mcc": "5812",
-        "category": "food"
-    }
     """
     transaction_id: str
     user_id: str
